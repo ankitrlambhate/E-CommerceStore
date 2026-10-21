@@ -1,0 +1,222 @@
+# E-Commerce Store: AWS Deployment with Terraform and Ansible
+
+A microservices e-commerce application deployed on AWS. **Terraform** builds the network and the server, **Ansible** installs Docker and deploys the application containers, and **Docker Hub** supplies the images.
+
+- Repository: https://github.com/ankitrlambhate/E-CommerceStore
+- Region: `ap-south-1` (Mumbai)
+
+## Architecture
+
+```mermaid
+flowchart TB
+    user([User's browser])
+    admin([Admin machine<br/>Terraform + Ansible])
+    hub[(Docker Hub<br/>5 images)]
+
+    subgraph aws["AWS ap-south-1"]
+        subgraph vpc["VPC 10.0.0.0/16"]
+            igw[Internet Gateway]
+            rt[Public route table<br/>0.0.0.0/0 to IGW]
+            subgraph subnet["Public subnet 10.0.1.0/24"]
+                subgraph ec2["EC2 t3.small, Ubuntu, 20 GB gp3 (ecommerce-app)<br/>Security group ecommerce-sg"]
+                    subgraph net["Docker network: ecommerce-net"]
+                        fe["frontend :80"]
+                        us["user-service :3001"]
+                        ps["product-service :3002"]
+                        cs["cart-service :3003"]
+                        os["order-service :3004"]
+                        mongo[("mongo :27017<br/>volume mongo-data")]
+                    end
+                end
+            end
+        end
+    end
+
+    user -- "HTTP 80" --> igw
+    admin -- "SSH 22 (admin IP only)" --> igw
+    igw --- rt --- subnet
+    fe -- "/svc/user/" --> us
+    fe -- "/svc/product/" --> ps
+    fe -- "/svc/cart/" --> cs
+    fe -- "/svc/order/" --> os
+    cs --> ps
+    os --> cs
+    os --> ps
+    os --> us
+    us --> mongo
+    ps --> mongo
+    cs --> mongo
+    os --> mongo
+    hub -. "docker pull" .-> ec2
+```
+
+### Request flow
+1. The browser loads the React frontend from the `frontend` container on port 80.
+2. API calls go to `/svc/<service>/...` on the same address, and are routed to the matching service container.
+3. The cart service calls the product service. The order service calls the cart, product and user services.
+4. Every service stores its data in its own database in one MongoDB container (`ecommerce_users`, `ecommerce_products`, `ecommerce_carts`, `ecommerce_orders`). Data is kept in the `mongo-data` Docker volume.
+
+### Containers
+
+| Container | Image | Port | Purpose |
+|---|---|---|---|
+| `frontend` | `<dockerhub-user>/ecommerce-frontend` | 80 | Web UI and entry point |
+| `user-service` | `<dockerhub-user>/ecommerce-user-service` | 3001 | Accounts and JWT login |
+| `product-service` | `<dockerhub-user>/ecommerce-product-service` | 3002 | Products and categories (`/api/products`, `/api/categories`) |
+| `cart-service` | `<dockerhub-user>/ecommerce-cart-service` | 3003 | Shopping carts |
+| `order-service` | `<dockerhub-user>/ecommerce-order-service` | 3004 | Orders |
+| `mongo` | `mongo:6` | 27017 (Docker network only) | Database |
+
+## What Terraform creates (12 resources)
+
+| Resource | Details |
+|---|---|
+| VPC | `10.0.0.0/16`, DNS support and hostnames on |
+| Public subnet | `10.0.1.0/24`, `ap-south-1a`, public IPs on launch |
+| Internet gateway and route table | Default route `0.0.0.0/0` to the gateway, associated with the subnet |
+| Security group `ecommerce-sg` | Inbound 80 from anywhere, 22 from your IP only, 3001-3004 from the group itself. Outbound all. |
+| EC2 instance `ecommerce-app` | `t3.small`, latest Ubuntu AMI, 20 GB gp3 root volume, SSH key from `key_name` |
+| `random_password` | 32-character JWT secret for the user service |
+
+Outputs: `public_ip`, `public_dns`, `frontend_url` and `verification_urls`.
+
+The instance also has a boot script (`user_data.sh.tpl`) that installs Docker and starts the containers. Ansible does the same job in a repeatable way and is the main deployment method.
+
+## What Ansible does
+
+`ansible/deploy.yml` connects to the instance over SSH and:
+
+1. Installs Docker and the Python Docker library.
+2. Creates the `ecommerce-net` network.
+3. Starts MongoDB with a persistent volume.
+4. Pulls the five application images from Docker Hub.
+5. Starts the four services and the frontend with their environment variables.
+6. Waits for ports 80 and 3001-3004, then checks `/healthz`.
+7. Seeds sample categories and products (`seed_products.py`) if the catalogue is empty.
+
+Re-running the playbook is safe: unchanged containers are left alone, and new images or settings are applied.
+
+## Repository layout
+
+```
+.
+├── backend/                   user, product, cart and order services (each with a Dockerfile)
+├── frontend/                  web UI (Dockerfile)
+├── terraform/
+│   ├── main.tf                VPC, subnet, gateway, routes, security group, EC2
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── versions.tf
+│   ├── user_data.sh.tpl       boot script rendered by Terraform
+│   ├── terraform.tfvars.example
+│   └── ansible/
+│       ├── deploy.yml         main playbook
+│       ├── vars.yml           Docker Hub username and image tag
+│       ├── requirements.yml   community.docker collection
+│       ├── seed_products.py   sample catalogue
+│       └── inventory.ini      (git-ignored, holds the server IP)
+└── docs/screenshots/          evidence of the working deployment
+```
+
+## Prerequisites
+
+- An AWS account and the AWS CLI configured (`aws configure`)
+- Terraform 1.5 or newer, Ansible, and Docker
+- A Docker Hub account
+- An SSH key pair registered in AWS, with its name set as `key_name`
+
+## Deploy it
+
+**1. Build and push the images** (from the repository root):
+
+```bash
+docker login
+for svc in user-service product-service cart-service order-service; do
+  docker build -t <dockerhub-user>/ecommerce-$svc:latest ./backend/$svc \
+    && docker push <dockerhub-user>/ecommerce-$svc:latest
+done
+docker build -t <dockerhub-user>/ecommerce-frontend:latest ./frontend \
+  && docker push <dockerhub-user>/ecommerce-frontend:latest
+```
+
+**2. Create the infrastructure:**
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars   # set dockerhub_username, ssh_cidr, key_name
+terraform init
+terraform plan
+terraform apply
+terraform output public_ip
+```
+
+**3. Deploy the application with Ansible:**
+
+```bash
+cd ansible
+ansible-galaxy collection install -r requirements.yml
+```
+
+Create `inventory.ini` with the new IP:
+
+```ini
+[app]
+ecommerce ansible_host=<public_ip> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/<your-key>
+```
+
+Set `dockerhub_username` and `image_tag` in `vars.yml`, then:
+
+```bash
+ansible app -i inventory.ini -m ping
+JWT=$(openssl rand -hex 24)
+ansible-playbook -i inventory.ini deploy.yml -e @vars.yml -e "jwt_secret=$JWT"
+```
+
+**4. Verify:**
+
+```bash
+curl http://<public_ip>/healthz
+curl http://<public_ip>/svc/product/api/products
+```
+
+Open `http://<public_ip>` in a browser. The products appear after the seed step.
+
+## Security
+
+- SSH (port 22) is open only to the administrator's IP (`ssh_cidr`), and login uses a key pair, not a password.
+- Port 80 is the only public port. Ports 3001-3004 are reachable only from members of the same security group.
+- MongoDB is not published on the host. It is reachable only inside the Docker network.
+- The JWT secret is generated by Terraform and passed to Ansible at run time. It is never committed.
+- `terraform.tfstate`, `terraform.tfvars` and `inventory.ini` are git-ignored because they contain sensitive values.
+
+## Limitations
+
+- One instance hosts everything, so there is no high availability.
+- MongoDB runs without authentication. That is acceptable for a lab, but not for production.
+- Data lives in a Docker volume on the instance and is deleted with the instance.
+- Traffic is plain HTTP, with no TLS certificate.
+
+## Troubleshooting
+
+| Problem | Check |
+|---|---|
+| `Permission denied (publickey)` | The instance must have a key pair (`key_name` set) and Ansible must use the matching private key |
+| SSH times out | `ssh_cidr` must be your current public IP. Update it and run `terraform apply` |
+| Image pull fails with "repository does not exist" | The images aren't pushed to Docker Hub, or the username in `vars.yml` is wrong |
+| Page loads but shows no products | Run the seed step: `ansible-playbook ... --tags seed` |
+| A container keeps restarting | `docker logs <name> --tail 50` on the server |
+
+Useful commands on the server: `sudo docker ps -a`, `sudo docker logs <name>`, `sudo docker stats --no-stream`.
+
+## Clean up
+
+```bash
+cd terraform
+terraform destroy
+```
+
+This removes every AWS resource created here and stops all charges. Application data on the instance is lost.
+
+## Screenshots
+
+Evidence of the working deployment is in [`docs/screenshots`](docs/screenshots).
