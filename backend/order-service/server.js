@@ -22,6 +22,11 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/ecommerce
 app.use('/api/orders', require('./routes/orders'));
 app.use('/api/payments', require('./routes/payments'));
 
+// Sample response
+app.get('/', (req, res) => {
+  res.send('Order Service Running');
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ service: 'Order Service', status: 'OK', port: PORT });

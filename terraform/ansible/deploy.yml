@@ -1,0 +1,128 @@
+---
+# Deploys the e-commerce stack (MongoDB + 4 services + frontend) with Docker.
+# Mirrors terraform/user_data.sh.tpl, but is repeatable: re-run it to update.
+- name: Deploy e-commerce stack
+  hosts: app
+  become: true
+  vars:
+    network_name: ecommerce-net
+    services:
+      - name: user-service
+        port: 3001
+        env:
+          PORT: "3001"
+          MONGODB_URI: "mongodb://mongo:27017/ecommerce_users"
+          JWT_SECRET: "{{ jwt_secret }}"
+      - name: product-service
+        port: 3002
+        env:
+          PORT: "3002"
+          MONGODB_URI: "mongodb://mongo:27017/ecommerce_products"
+      - name: cart-service
+        port: 3003
+        env:
+          PORT: "3003"
+          MONGODB_URI: "mongodb://mongo:27017/ecommerce_carts"
+          PRODUCT_SERVICE_URL: "http://product-service:3002"
+      - name: order-service
+        port: 3004
+        env:
+          PORT: "3004"
+          MONGODB_URI: "mongodb://mongo:27017/ecommerce_orders"
+          CART_SERVICE_URL: "http://cart-service:3003"
+          PRODUCT_SERVICE_URL: "http://product-service:3002"
+          USER_SERVICE_URL: "http://user-service:3001"
+
+  tasks:
+    - name: Install Docker and the Python Docker library
+      ansible.builtin.apt:
+        name: [docker.io, python3-docker, curl]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Enable and start Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create the app network
+      community.docker.docker_network:
+        name: "{{ network_name }}"
+
+    - name: Pull MongoDB image
+      community.docker.docker_image:
+        name: mongo:6
+        source: pull
+
+    - name: Run MongoDB (data kept in the mongo-data volume)
+      community.docker.docker_container:
+        name: mongo
+        image: mongo:6
+        networks: [{ name: "{{ network_name }}" }]
+        volumes: ["mongo-data:/data/db"]
+        restart_policy: unless-stopped
+        state: started
+
+    - name: Pull service images
+      community.docker.docker_image:
+        name: "{{ dockerhub_username }}/ecommerce-{{ item }}:{{ image_tag }}"
+        source: pull
+        force_source: true
+      loop: [user-service, product-service, cart-service, order-service, frontend]
+
+    - name: Run the backend services
+      community.docker.docker_container:
+        name: "{{ item.name }}"
+        image: "{{ dockerhub_username }}/ecommerce-{{ item.name }}:{{ image_tag }}"
+        networks: [{ name: "{{ network_name }}" }]
+        published_ports: ["{{ item.port }}:{{ item.port }}"]
+        env: "{{ item.env }}"
+        restart_policy: unless-stopped
+        state: started
+      loop: "{{ services }}"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+
+    - name: Run the frontend
+      community.docker.docker_container:
+        name: frontend
+        image: "{{ dockerhub_username }}/ecommerce-frontend:{{ image_tag }}"
+        networks: [{ name: "{{ network_name }}" }]
+        published_ports: ["80:80"]
+        restart_policy: unless-stopped
+        state: started
+
+    - name: Wait for every service port
+      ansible.builtin.wait_for:
+        port: "{{ item }}"
+        timeout: 90
+      loop: [3001, 3002, 3003, 3004, 80]
+
+    - name: Frontend health check
+      ansible.builtin.uri:
+        url: http://127.0.0.1/healthz
+        status_code: 200
+      retries: 6
+      delay: 5
+      register: health
+      until: health.status == 200
+
+    - name: Seed sample catalogue (skipped if products already exist)
+      ansible.builtin.script: seed_products.py http://127.0.0.1:3002
+      args:
+        executable: python3
+      register: seed
+      changed_when: "'SEEDED' in seed.stdout"
+      tags: [seed]
+
+    - name: List running containers
+      ansible.builtin.command: docker ps --format "table {{ '{{.Names}}' }}\t{{ '{{.Status}}' }}\t{{ '{{.Ports}}' }}"
+      register: ps
+      changed_when: false
+
+    - name: Show containers
+      ansible.builtin.debug:
+        msg: "{{ ps.stdout_lines }}"

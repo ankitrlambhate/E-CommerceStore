@@ -1,0 +1,12 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+crash.log
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform.tfvars
+ansible/inventory.ini
+ansible/*.retry
+*.pem
